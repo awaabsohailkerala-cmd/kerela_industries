@@ -58,7 +58,7 @@ const ShelfAllocationEditor = ({
     const usedShelfIds = new Set(allocations.map((a) => String(a.shelf_id)).filter(Boolean));
 
     const handleAddRow = () => {
-        onChange([...allocations, { shelf_id: '', quantity: remaining > 0 ? remaining : '', shelf_name: '' }]);
+        onChange([...allocations, { shelf_id: '', quantity: remaining > 0 ? Number(remaining.toFixed(4)) : '', shelf_name: '' }]);
     };
 
     const handleUpdateRow = (index, patch) => {
