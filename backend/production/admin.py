@@ -81,7 +81,7 @@ class RecipeIssuedMaterialInline(admin.TabularInline):
 class RecipeBreakdownItemInline(admin.TabularInline):
     model    = RecipeBreakdownItem
     extra    = 0
-    readonly_fields = ("wip_product", "quantity", "remaining_quantity", "unit_cost_snapshot", "full_unit_cost_snapshot")
+    readonly_fields = ("wip_product", "quantity", "remaining_quantity", "unit_cost_before_waste", "unit_cost_snapshot", "full_unit_cost_snapshot")
     can_delete = False
 
 

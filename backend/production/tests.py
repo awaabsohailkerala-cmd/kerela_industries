@@ -569,3 +569,150 @@ class WipAutoAllocateTests(PackingRecipeTestBase):
         self.assertEqual(len(response.data["allocations"]), 3)
         # 1 allocation query + auth/session overhead is none under force_authenticate.
         self.assertLessEqual(len(ctx.captured_queries), 2)
+
+
+class RewindingMaterialCostTests(TestCase):
+    """
+    finish_recipe's per-unit material cost: jumbo_rate x item yards + core_rate
+    (Before Waste), + flat waste share (After Waste), + DL/FOH share (Full).
+    Issued materials/consumptions are written directly so each test controls
+    the exact FIFO batch rates and issued quantities.
+    """
+
+    def setUp(self):
+        call_command("seed_fixed_products")
+        self.factory = APIRequestFactory()
+        self.admin = make_admin()
+        self.shelf = Shelf.objects.create(name="Shelf A")
+        supplier = create_supplier(name="Ali Traders", code="ALI", user=self.admin)
+        self.employee = create_employee(
+            name="Test Worker", monthly_salary=Decimal("30000"),
+            avg_hours_per_day=Decimal("8"), working_days_per_month=26, user=self.admin,
+        )
+        self.machine = create_machine(
+            name="Test Rewinder", category=Machine.Category.REWINDING, monthly_repair_cost=Decimal("5000"),
+            avg_hours_per_day=Decimal("8"), working_days_per_month=26, user=self.admin,
+        )
+        core_length = create_core_length(value="1", user=self.admin)
+        from purchases.services import create_jumbo_name
+        jumbo_name = create_jumbo_name(value="binding 210", user=self.admin)
+        jumbo_order = create_jumbo_purchase(
+            supplier_id=supplier.id, jumbo_name_id=jumbo_name.id, rate_per_kg=Decimal("50"),
+            weight_kg=Decimal("100"), expected_length_m=Decimal("100"), user=self.admin,
+        )
+        cores_order = create_core_purchase(
+            supplier_id=supplier.id, quantity=Decimal("20"), unit_price=Decimal("10"),
+            core_length_id=core_length.id, user=self.admin,
+        )
+        self.jumbo_item = jumbo_order.items.first()
+        self.cores_item = cores_order.items.first()
+
+    def _finish(self, *, jumbo_batches, cores_batches, jumbo_issued, cores_issued, items):
+        """jumbo_batches/cores_batches: [(qty, unit_cost)]; items: [(yard, qty)]."""
+        from .models import RecipeIssuedMaterial, RecipeMaterialConsumption
+
+        recipe = create_recipe(name="Cost Test", user=self.admin)
+        for kind, product, issued_qty, batches, purchase_item in (
+            ("jumbo", self.jumbo_item.product, jumbo_issued, jumbo_batches, self.jumbo_item),
+            ("cores", self.cores_item.product, cores_issued, cores_batches, self.cores_item),
+        ):
+            issued = RecipeIssuedMaterial.objects.create(recipe=recipe, kind=kind, product=product, quantity=issued_qty)
+            for qty, cost in batches:
+                RecipeMaterialConsumption.objects.create(
+                    issued_material=issued, purchase_item=purchase_item, quantity=qty, unit_cost=cost,
+                )
+        for yard, qty in items:
+            add_breakdown_item(
+                recipe_id=recipe.id, yard_value=Decimal(yard), quantity=Decimal(qty),
+                shelf_allocations=[{"shelf_id": self.shelf.id, "quantity": Decimal(qty)}], user=self.admin,
+            )
+        update_recipe_description(recipe_id=recipe.id, description="x", user=self.admin)
+        set_recipe_time(recipe_id=recipe.id, hours=1, minutes=0, user=self.admin)
+        add_recipe_labor(recipe_id=recipe.id, employee_id=self.employee.id, user=self.admin)
+        add_recipe_machine(recipe_id=recipe.id, machine_id=self.machine.id, user=self.admin)
+        finish_recipe(recipe_id=recipe.id, user=self.admin)
+        return recipe, list(recipe.breakdown_items.order_by("id"))
+
+    def _assert_close(self, a, b, tol="0.01"):
+        self.assertLess(abs(Decimal(a) - Decimal(b)), Decimal(tol), f"{a} vs {b}")
+
+    def test_client_example_no_waste(self):
+        recipe, items = self._finish(
+            jumbo_batches=[(Decimal("5380"), Decimal("10"))], cores_batches=[(Decimal("76"), Decimal("105"))],
+            jumbo_issued=Decimal("5380"), cores_issued=Decimal("76"),
+            items=[("30", "11"), ("70", "40"), ("90", "25")],
+        )
+        self.assertEqual([i.unit_cost_before_waste for i in items], [Decimal("405"), Decimal("805"), Decimal("1005")])
+        # 30*11 + 70*40 + 90*25 == 5380 issued and 11+40+25 == 76 issued -> no waste.
+        self.assertEqual([i.unit_cost_snapshot for i in items], [i.unit_cost_before_waste for i in items])
+        # Full cost = After Waste + a flat DL/FOH share.
+        pool = sum(i.quantity * (i.full_unit_cost_snapshot - i.unit_cost_snapshot) for i in items)
+        self.assertGreater(pool, 0)
+        recipe.refresh_from_db()
+        self._assert_close(recipe.cost_per_unit, Decimal(11 * 405 + 40 * 805 + 25 * 1005) / Decimal(76), "0.001")
+
+    def test_two_batches_use_average_rate(self):
+        _, items = self._finish(
+            jumbo_batches=[(Decimal("2000"), Decimal("10")), (Decimal("2000"), Decimal("12"))],
+            cores_batches=[(Decimal("100"), Decimal("105"))],
+            jumbo_issued=Decimal("4000"), cores_issued=Decimal("100"),
+            items=[("40", "100")],
+        )
+        self.assertEqual(items[0].unit_cost_before_waste, Decimal("545"))  # 11*40 + 105
+        self.assertEqual(items[0].unit_cost_snapshot, Decimal("545"))
+
+    def test_jumbo_waste_spread_flat(self):
+        _, items = self._finish(
+            jumbo_batches=[(Decimal("5480"), Decimal("10"))], cores_batches=[(Decimal("76"), Decimal("105"))],
+            jumbo_issued=Decimal("5480"), cores_issued=Decimal("76"),
+            items=[("30", "11"), ("70", "40"), ("90", "25")],
+        )
+        # 100 unused jumbo yards @10 = 1000, spread over 76 units.
+        self._assert_close(sum(i.quantity * (i.unit_cost_snapshot - i.unit_cost_before_waste) for i in items), Decimal("1000"))
+        self.assertEqual(items[0].unit_cost_snapshot - items[0].unit_cost_before_waste, Decimal("13.1579"))
+
+    def test_core_waste_spread_flat(self):
+        _, items = self._finish(
+            jumbo_batches=[(Decimal("5380"), Decimal("10"))], cores_batches=[(Decimal("80"), Decimal("105"))],
+            jumbo_issued=Decimal("5380"), cores_issued=Decimal("80"),
+            items=[("30", "11"), ("70", "40"), ("90", "25")],
+        )
+        # 4 unused cores @105 = 420.
+        self._assert_close(sum(i.quantity * (i.unit_cost_snapshot - i.unit_cost_before_waste) for i in items), Decimal("420"))
+
+    def test_used_above_issued_adds_no_waste(self):
+        _, items = self._finish(
+            jumbo_batches=[(Decimal("5000"), Decimal("10"))], cores_batches=[(Decimal("70"), Decimal("105"))],
+            jumbo_issued=Decimal("5000"), cores_issued=Decimal("70"),
+            items=[("30", "11"), ("70", "40"), ("90", "25")],
+        )
+        self.assertEqual([i.unit_cost_snapshot for i in items], [i.unit_cost_before_waste for i in items])
+
+    def test_over_use_of_one_kind_does_not_offset_waste_of_the_other(self):
+        _, items = self._finish(
+            jumbo_batches=[(Decimal("5000"), Decimal("10"))], cores_batches=[(Decimal("80"), Decimal("105"))],
+            jumbo_issued=Decimal("5000"), cores_issued=Decimal("80"),
+            items=[("30", "11"), ("70", "40"), ("90", "25")],
+        )
+        # jumbo over-used (no waste, no credit); only the 4 spare cores @105 = 420 counts.
+        self._assert_close(sum(i.quantity * (i.unit_cost_snapshot - i.unit_cost_before_waste) for i in items), Decimal("420"))
+
+    def test_detail_api_exposes_before_waste_cost(self):
+        recipe, _ = self._finish(
+            jumbo_batches=[(Decimal("2100"), Decimal("10"))], cores_batches=[(Decimal("70"), Decimal("105"))],
+            jumbo_issued=Decimal("2100"), cores_issued=Decimal("70"), items=[("30", "70")],
+        )
+        from .views import RecipeRetrieveView
+        request = self.factory.get(f"/production/recipes/{recipe.id}/")
+        force_authenticate(request, user=self.admin)
+        with CaptureQueriesContext(connection) as ctx:
+            response = RecipeRetrieveView.as_view()(request, pk=recipe.id)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(Decimal(response.data["breakdown_items"][0]["unit_cost_before_waste"]), Decimal("405"))
+        self.assertLess(len(ctx.captured_queries), 25)
+
+        normal = make_normal_user()
+        request2 = self.factory.get(f"/production/recipes/{recipe.id}/")
+        force_authenticate(request2, user=normal)
+        self.assertEqual(RecipeRetrieveView.as_view()(request2, pk=recipe.id).status_code, 403)
+

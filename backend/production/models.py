@@ -382,6 +382,12 @@ class RecipeBreakdownItem(AuditMixin):
     wip_product        = models.ForeignKey(WipProduct, on_delete=models.PROTECT, related_name="breakdown_items")
     quantity           = models.DecimalField(max_digits=14, decimal_places=4)
     remaining_quantity = models.DecimalField(max_digits=14, decimal_places=4, default=0)
+    # Material cost of ONE unit before any waste: jumbo_rate × this item's
+    # yards + core_rate (avg FIFO rates of what the recipe issued). Frozen at
+    # finish_recipe. Null on recipes finished before this field existed.
+    unit_cost_before_waste = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
+    # unit_cost_before_waste + this recipe's jumbo/core waste cost spread flat
+    # per unit ("After Waste" in the UI).
     unit_cost_snapshot = models.DecimalField(max_digits=14, decimal_places=4, null=True, blank=True)
     # unit_cost_snapshot + this recipe's DL+FOH pool share — the Full
     # Manufacturing Cost. This is what flows into Cutting as its material

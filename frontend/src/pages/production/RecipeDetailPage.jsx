@@ -884,9 +884,12 @@ const RecipeDetailPage = () => {
                                     <th className="px-3 py-2 text-left text-xs font-medium text-neutral-500">Quantity</th>
                                     <th className="px-3 py-2 text-left text-xs font-medium text-neutral-500">Remaining</th>
                                     <th className="px-3 py-2 text-left text-xs font-medium text-neutral-500">Shelves</th>
-                                    <th className="px-3 py-2 text-right text-xs font-medium text-neutral-500">Material Cost</th>
                                     {isFinished && (
-                                        <th className="px-3 py-2 text-right text-xs font-medium text-neutral-500">Full Cost</th>
+                                        <>
+                                            <th className="px-3 py-2 text-right text-xs font-medium text-neutral-500">Before Waste</th>
+                                            <th className="px-3 py-2 text-right text-xs font-medium text-neutral-500">After Waste</th>
+                                            <th className="px-3 py-2 text-right text-xs font-medium text-neutral-500">Full Cost</th>
+                                        </>
                                     )}
                                     {!isFinished && (
                                         <th className="px-3 py-2 text-right text-xs font-medium text-neutral-500">Actions</th>
@@ -905,13 +908,18 @@ const RecipeDetailPage = () => {
                                                     ? item.shelf_allocations.map((a) => `${a.shelf_name} (${a.quantity})`).join(', ')
                                                     : '—'}
                                             </td>
-                                            <td className="px-3 py-2 text-sm text-right font-medium">
-                                                {item.unit_cost_snapshot != null ? parseFloat(item.unit_cost_snapshot).toFixed(2) : '—'}
-                                            </td>
                                             {isFinished && (
-                                                <td className="px-3 py-2 text-sm text-right font-medium">
-                                                    {item.full_unit_cost_snapshot != null ? parseFloat(item.full_unit_cost_snapshot).toFixed(2) : '—'}
-                                                </td>
+                                                <>
+                                                    <td className="px-3 py-2 text-sm text-right">
+                                                        {item.unit_cost_before_waste != null ? parseFloat(item.unit_cost_before_waste).toFixed(2) : '—'}
+                                                    </td>
+                                                    <td className="px-3 py-2 text-sm text-right font-medium">
+                                                        {item.unit_cost_snapshot != null ? parseFloat(item.unit_cost_snapshot).toFixed(2) : '—'}
+                                                    </td>
+                                                    <td className="px-3 py-2 text-sm text-right font-medium">
+                                                        {item.full_unit_cost_snapshot != null ? parseFloat(item.full_unit_cost_snapshot).toFixed(2) : '—'}
+                                                    </td>
+                                                </>
                                             )}
                                             {!isFinished && (
                                                 <td className="px-3 py-2 text-right">
@@ -938,7 +946,7 @@ const RecipeDetailPage = () => {
                                         </tr>
                                         {editingItemId === item.id && (
                                             <tr>
-                                                <td colSpan={isFinished ? 6 : 6} className="px-3 pb-3">
+                                                <td colSpan={isFinished ? 8 : 6} className="px-3 pb-3">
                                                     <BreakdownItemEditForm
                                                         item={item}
                                                         onSave={(payload) => handleUpdateBreakdownItem(item.id, payload)}

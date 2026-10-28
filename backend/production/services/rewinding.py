@@ -544,7 +544,11 @@ def finish_recipe(*, recipe_id: int, user) -> Recipe:
     if not recipe.description or not recipe.description.strip():
         raise ValidationError({"description": "Description is required before finishing this recipe."})
 
-    breakdown_items = list(recipe.breakdown_items.prefetch_related("shelf_allocations").all())
+    # select_related("wip_product__yard") — the cost calc below reads every
+    # item's yard; without it that's one query per item.
+    breakdown_items = list(
+        recipe.breakdown_items.select_related("wip_product__yard").prefetch_related("shelf_allocations__shelf").order_by("id")
+    )
     # (issued materials/consumptions below are read fresh off the now-locked
     # recipe — not the cached prefetch from get_recipe_by_id — so the cost
     # calc reflects state as of this lock, not an earlier snapshot.)
@@ -553,42 +557,55 @@ def finish_recipe(*, recipe_id: int, user) -> Recipe:
     labor, machines = get_recipe_labor_and_machines(recipe)
     validate_labor_and_machines(recipe, labor=labor, machines=machines)
 
-    total_cost = Decimal("0")
-    for issued in recipe.issued_materials.all():
+    # Avg FIFO rate per issued kind (Σ consumption cost ÷ Σ consumption
+    # quantity), e.g. 2000 yd @10 + 2000 yd @12 -> 11 per jumbo yard.
+    # Carried at full precision; rounding happens only when an item's cost
+    # is stored.
+    rates = {}
+    issued_quantities = {}
+    for issued in recipe.issued_materials.prefetch_related("consumptions"):
+        kind_cost = Decimal("0")
+        kind_consumed = Decimal("0")
         for consumption in issued.consumptions.all():
-            total_cost += consumption.quantity * consumption.unit_cost
+            kind_cost += consumption.quantity * consumption.unit_cost
+            kind_consumed += consumption.quantity
+        rates[issued.kind] = kind_cost / kind_consumed if kind_consumed > 0 else Decimal("0")
+        issued_quantities[issued.kind] = issued.quantity
+    jumbo_rate = rates.get(RecipeIssuedMaterial.MaterialKind.JUMBO, Decimal("0"))
+    core_rate = rates.get(RecipeIssuedMaterial.MaterialKind.CORES, Decimal("0"))
 
+    # Stage 1 — Before Waste: one unit's material = jumbo_rate × the item's
+    # yards + one core's cost.
+    precision = Decimal("0.0001")
     total_output_quantity = sum((item.quantity for item in breakdown_items), Decimal("0"))
-    cost_per_unit = (
-        (total_cost / total_output_quantity).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-        if total_output_quantity > 0 else Decimal("0")
-    )
+    for item in breakdown_items:
+        item.unit_cost_before_waste = (jumbo_rate * item.wip_product.yard.value + core_rate).quantize(precision, rounding=ROUND_HALF_UP)
 
-    # cost_per_unit is a blended rate rounded to 4dp — stamping it as-is on
-    # every item would make Σ(item.quantity × unit_cost_snapshot) drift from
-    # the exact total_cost whenever the division doesn't come out even
-    # (same rounding-order mistake as Jumbo/Packing purchase costing). Every
-    # item but the last gets the blended rate; the last item absorbs
-    # whatever's left of total_cost, so the sum reconciles exactly (down to
-    # the field's own 4dp storage limit on that one item).
-    remaining_cost = total_cost
-    for item in breakdown_items[:-1]:
-        item.unit_cost_snapshot = cost_per_unit
-        remaining_cost -= item.quantity * cost_per_unit
-    last_item = breakdown_items[-1]
-    last_item.unit_cost_snapshot = (
-        (remaining_cost / last_item.quantity).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-        if last_item.quantity > 0 else Decimal("0")
-    )
+    # Waste: issued jumbo yards / cores the breakdown didn't use. Used jumbo =
+    # Σ(item yards × item quantity); used cores = Σ(item quantity). A kind
+    # whose used amount meets or exceeds what was issued adds no waste cost
+    # (never negative, never offsets the other kind).
+    jumbo_used = sum((item.wip_product.yard.value * item.quantity for item in breakdown_items), Decimal("0"))
+    core_used = total_output_quantity
+    jumbo_waste = max(Decimal("0"), issued_quantities.get(RecipeIssuedMaterial.MaterialKind.JUMBO, Decimal("0")) - jumbo_used)
+    core_waste = max(Decimal("0"), issued_quantities.get(RecipeIssuedMaterial.MaterialKind.CORES, Decimal("0")) - core_used)
+    waste_cost = jumbo_waste * jumbo_rate + core_waste * core_rate
 
-    # DL+FOH pool spread flat across the same output items, on top of the
-    # material cost just computed above — gives each item its Full
-    # Manufacturing Cost. See services/_shared.py's module docstring.
+    # Stage 2 — After Waste: waste cost spread flat per output unit,
+    # residual on the last item (see spread_pool_flat).
+    waste_shares = spread_pool_flat(breakdown_items, waste_cost)
+    for item in breakdown_items:
+        item.unit_cost_snapshot = (item.unit_cost_before_waste + waste_shares[item]).quantize(precision, rounding=ROUND_HALF_UP)
+
+    # Stage 3 — Full: DL+FOH pool spread flat across the same output items,
+    # on top of the After-Waste cost. See services/_shared.py's module docstring.
     pool = compute_labor_overhead_pool(recipe, labor=labor, machines=machines)
     shares = spread_pool_flat(breakdown_items, pool)
     for item in breakdown_items:
-        item.full_unit_cost_snapshot = (item.unit_cost_snapshot + shares[item]).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
-    RecipeBreakdownItem.objects.bulk_update(breakdown_items, ["unit_cost_snapshot", "full_unit_cost_snapshot"])
+        item.full_unit_cost_snapshot = (item.unit_cost_snapshot + shares[item]).quantize(precision, rounding=ROUND_HALF_UP)
+    RecipeBreakdownItem.objects.bulk_update(
+        breakdown_items, ["unit_cost_before_waste", "unit_cost_snapshot", "full_unit_cost_snapshot"],
+    )
 
     # Put away each item's stock now that its cost is known — quantity and
     # cost land together, same shape as a real purchase (see
@@ -609,9 +626,16 @@ def finish_recipe(*, recipe_id: int, user) -> Recipe:
     record_dl_foh_accrued(pool)
 
     recipe.status = Recipe.Status.FINISHED
-    recipe.cost_per_unit = cost_per_unit
+    # Recipe-level headline rates derived from the stored per-item costs so
+    # they always match the breakdown table.
+    recipe.cost_per_unit = (
+        (sum((i.quantity * i.unit_cost_snapshot for i in breakdown_items), Decimal("0")) / total_output_quantity)
+        .quantize(precision, rounding=ROUND_HALF_UP)
+        if total_output_quantity > 0 else Decimal("0")
+    )
     recipe.full_cost_per_unit = (
-        ((total_cost + pool) / total_output_quantity).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+        (sum((i.quantity * i.full_unit_cost_snapshot for i in breakdown_items), Decimal("0")) / total_output_quantity)
+        .quantize(precision, rounding=ROUND_HALF_UP)
         if total_output_quantity > 0 else Decimal("0")
     )
     recipe.finished_by = user

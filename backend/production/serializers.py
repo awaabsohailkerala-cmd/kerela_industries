@@ -216,8 +216,10 @@ class RecipeBreakdownItemReadSerializer(serializers.ModelSerializer):
 
     class Meta:
         model  = RecipeBreakdownItem
-        fields = ["id", "wip_product", "quantity", "remaining_quantity", "unit_cost_snapshot",
-                  "full_unit_cost_snapshot", "shelf_allocations", "created_at"]
+        # unit_cost_before_waste / unit_cost_snapshot are "Before Waste" /
+        # "After Waste" in the UI; full_unit_cost_snapshot adds DL+FOH.
+        fields = ["id", "wip_product", "quantity", "remaining_quantity", "unit_cost_before_waste",
+                  "unit_cost_snapshot", "full_unit_cost_snapshot", "shelf_allocations", "created_at"]
         read_only_fields = fields
 
 
